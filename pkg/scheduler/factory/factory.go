@@ -23,6 +23,8 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang/glog"
@@ -76,6 +78,8 @@ var (
 	generalPredicatesSets         = sets.NewString(predicates.GeneralPred)
 	noDiskConflictSet             = sets.NewString(predicates.NoDiskConflictPred)
 	maxPDVolumeCountPredicateKeys = []string{predicates.MaxGCEPDVolumeCountPred, predicates.MaxAzureDiskVolumeCountPred, predicates.MaxEBSVolumeCountPred}
+	podStartTimes                 = make(map[string]time.Time)     //tanle
+	podStopTimes                  = make(map[string]time.Duration) //tanle
 )
 
 // configFactory is the default implementation of the scheduler.Configurator interface.
@@ -140,6 +144,10 @@ type configFactory struct {
 	// percentageOfNodesToScore specifies percentage of all nodes to score in each scheduling cycle.
 	percentageOfNodesToScore int32
 }
+
+const ReplicateJobFeature = false //tanle
+const UpdateJobFeature = false    //tanle
+var LogComplTimeFeature = true    //tanle
 
 // ConfigFactoryArgs is a set arguments passed to NewConfigFactory.
 type ConfigFactoryArgs struct {
@@ -721,8 +729,40 @@ func (c *configFactory) addPodToCache(obj interface{}) {
 	// handled optimistically in: pkg/scheduler/scheduler.go#assume()
 }
 
+// update fair score
+func (f *configFactory) UpdateFairScore() {
+	podClient := f.client.CoreV1().Pods(v1.NamespaceAll)
+	pods, err := podClient.List(metav1.ListOptions{
+		LabelSelector: labels.Everything().String(),
+	})
+	if err == nil {
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
+				schedulercache.UpdateFairScore(&pod, false)
+			}
+		}
+	} else {
+		glog.Errorf("[tanle] error %v", err)
+	}
+}
+
+// tanle delete pod from scheduling queue
+func (factory *configFactory) DeletePod(podQueue core.SchedulingQueue) func(pod *v1.Pod) {
+	return func(pod *v1.Pod) {
+		podQueue.Delete(pod)
+	}
+}
+
 func (c *configFactory) updatePodInCache(oldObj, newObj interface{}) {
 	oldPod, ok := oldObj.(*v1.Pod)
+
+	//tanle list all pods whenever there is an update.
+	// glog.Infof("[tanle] updatePodInCache")
+	if LogComplTimeFeature {
+		c.computeComplTimeForAllPods(false)
+	}
+	// c.UpdateFairScore()
+
 	if !ok {
 		glog.Errorf("cannot convert oldObj to *v1.Pod: %v", oldObj)
 		return
@@ -744,9 +784,276 @@ func (c *configFactory) updatePodInCache(oldObj, newObj interface{}) {
 	c.podQueue.AssignedPodUpdated(newPod)
 }
 
+func (f *configFactory) computeComplTimeForAllPods(isCompleted bool) {
+	// glog.Infof("[tanle] list all completed pods")
+	podClient := f.client.CoreV1().Pods(v1.NamespaceAll)
+	pods, err := podClient.List(metav1.ListOptions{
+		LabelSelector: labels.Everything().String(),
+	})
+	if err == nil {
+		for _, pod := range pods.Items {
+			if isCompleted && pod.Status.Phase == v1.PodSucceeded {
+				// glog.Infof("[tanle] %v %s", pod.Name, pod.Status.Phase)
+				if podStopTimes[pod.Name] == 0 {
+					podStopTimes[pod.Name] = time.Since(podStartTimes[pod.Name])
+					// fmt.Println(" %v", podStopTimes)
+					glog.Infof("[tanle] Event pod completed %v/%s", pod.Namespace, pod.Name, pod.Status.Phase)
+					schedulercache.UpdateFairScore(&pod, false)
+					schedulercache.DeletePodFromCache(&pod)
+				}
+			} else if !isCompleted && pod.Status.Phase == v1.PodRunning && pod.Namespace != "kube-scheduler" {
+				// glog.Infof("[tanle] %v %s", pod.Name, pod.Status.Phase)
+				if podStartTimes[pod.Name].IsZero() {
+					podStartTimes[pod.Name] = time.Now()
+				}
+			}
+		}
+	} else {
+		glog.Errorf("[tanle] error %v", err)
+	}
+}
+
+const GI = 1024 * 1024 * 1024
+
+//tanle
+func (c *configFactory) replicatePod(pod *v1.Pod, isGPU bool) {
+	cpuSuffix := "-rcpu"
+	gpuSuffix := "-rgpu"
+	if strings.Contains(pod.Name, cpuSuffix) || strings.Contains(pod.Name, gpuSuffix) {
+		return
+	}
+	// replicatedPod := obj.(*v1.Pod).DeepCopy()
+	sufix := cpuSuffix
+	if isGPU {
+		sufix = gpuSuffix
+	}
+
+	replicatedPod := pod.DeepCopy()
+	replicatedPod.Name = replicatedPod.Name + sufix
+	replicatedPod.Namespace = "default"
+
+	for cName, container := range replicatedPod.Spec.Containers {
+		container.Name = container.Name + sufix
+		isGpuJob := false
+		if strings.Contains(container.Image, "gpu") {
+			isGpuJob = true
+		}
+		if isGPU {
+			container.Image = "lenhattan86/ira:gpu"
+		} else {
+			container.Image = "lenhattan86/ira:cpu"
+		}
+		mainCmd := container.Command[2]
+		secCmd := container.Command[3]
+		if isGpuJob != isGPU {
+			mainCmd = container.Command[3]
+			secCmd = container.Command[2]
+		}
+		container.Command[2] = mainCmd[0:strings.LastIndex(mainCmd, "--num_batches=")] + "--num_batches=100"
+		container.Command[3] = secCmd[0:strings.LastIndex(secCmd, "--num_batches=")] + "--num_batches=100"
+
+		// demands
+		// primCpu, primGpu, primMem := GetPrimDemand(pod)
+		secCpu, secGpu, secMem := GetSecondaryDemand(pod)
+
+		for rName := range container.Resources.Requests {
+			quantity := container.Resources.Requests[rName]
+			switch rName {
+			case v1.ResourceCPU:
+				if isGpuJob != isGPU {
+					quantity.SetMilli(secCpu)
+				}
+			case schedulercache.NvidiaGPU:
+				if isGpuJob != isGPU {
+					quantity.Set(secGpu)
+				}
+			case v1.ResourceMemory:
+				if isGpuJob != isGPU {
+					quantity.Set(secMem * GI)
+				}
+			}
+
+			container.Resources.Requests[rName] = quantity
+			container.Resources.Limits[rName] = quantity
+		}
+		replicatedPod.Spec.Containers[cName] = container
+	}
+
+	replicatedPod.ResourceVersion = ""
+	replicatedPod.Spec.NodeName = ""
+	replicatedPod.Annotations = nil
+
+	podClient := c.client.CoreV1().Pods(replicatedPod.Namespace)
+	if _, err := podClient.Create(replicatedPod); err != nil {
+		runtime.HandleError(fmt.Errorf("unable to create pod in kubectl %T: %v", replicatedPod, err))
+	}
+}
+
+func GetSecondaryDemand(pod *v1.Pod) (int64, int64, int64) {
+	milliCPU := int64(0)
+	gpu := int64(0)
+	memInGi := int64(0)
+	for _, container := range pod.Spec.Containers {
+		// switch demands
+		secDemand := container.Command[5]
+
+		strDemands := strings.Split(secDemand, ",")
+		cpuDemand, err := strconv.ParseInt(strDemands[0], 10, 64)
+		if err != nil {
+			glog.Infof("Failed  to convert cpuDemand %s to int64", strDemands[0])
+		}
+		gpuDemand, err := strconv.ParseInt(strDemands[1], 10, 64)
+		if err != nil {
+			glog.Infof("Failed to convert gpuDemand %s to int64", strDemands[1])
+		}
+		memory, err := strconv.ParseInt(strDemands[2], 10, 64)
+		if err != nil {
+			glog.Infof("Failed to convert memory %s to int64", strDemands[2])
+		}
+
+		milliCPU += cpuDemand
+		gpu += gpuDemand
+		memInGi += memory
+	}
+
+	return milliCPU, gpu, memInGi
+}
+
+func GetPrimDemand(pod *v1.Pod) (int64, int64, int64) {
+	milliCPU := int64(0)
+	gpu := int64(0)
+	memInGi := int64(0)
+	for _, container := range pod.Spec.Containers {
+		// switch demands
+		secDemand := container.Command[4]
+
+		strDemands := strings.Split(secDemand, ",")
+		cpuDemand, err := strconv.ParseInt(strDemands[0], 10, 64)
+		if err != nil {
+			glog.Infof("Failed  to convert cpuDemand %s to int64", strDemands[0])
+		}
+		gpuDemand, err := strconv.ParseInt(strDemands[1], 10, 64)
+		if err != nil {
+			glog.Infof("Failed to convert gpuDemand %s to int64", strDemands[1])
+		}
+		memory, err := strconv.ParseInt(strDemands[2], 10, 64)
+		if err != nil {
+			glog.Infof("Failed to convert memory %s to int64", strDemands[2])
+		}
+
+		milliCPU += cpuDemand
+		gpu += gpuDemand
+		memInGi += memory
+	}
+
+	return milliCPU, gpu, memInGi
+}
+
+func (c *configFactory) switchPod(pod *v1.Pod) {
+	isGpuJob := false
+	toBeGPU := false
+	// check the device of the pod
+	for _, container := range pod.Spec.Containers {
+		if strings.Contains(container.Image, "gpu") {
+			isGpuJob = true
+			break
+		}
+	}
+
+	if !isGpuJob {
+		return
+	}
+	// delete the pod in kube system
+	replicatedPod := pod.DeepCopy()
+
+	for cName, container := range replicatedPod.Spec.Containers {
+		if toBeGPU {
+			container.Image = "lenhattan86/ira:gpu"
+		} else {
+			container.Image = "lenhattan86/ira:cpu"
+		}
+		mainCmd := container.Command[3]
+		container.Command[3] = container.Command[2]
+		container.Command[2] = mainCmd
+
+		for rName := range container.Resources.Requests {
+			quantity := container.Resources.Requests[rName]
+			switch rName {
+			case v1.ResourceCPU:
+				if toBeGPU {
+					quantity.Set(1)
+				} else {
+					quantity.Set(16)
+				}
+			case schedulercache.NvidiaGPU:
+				if toBeGPU {
+					quantity.Set(1)
+				} else {
+					quantity.Set(0)
+				}
+			}
+			container.Resources.Requests[rName] = quantity
+			container.Resources.Limits[rName] = quantity
+		}
+		replicatedPod.Spec.Containers[cName] = container
+	}
+
+	replicatedPod.ResourceVersion = ""
+	replicatedPod.Spec.NodeName = ""
+	replicatedPod.Annotations = nil
+
+	// p.Client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
+	if err := c.client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{}); err != nil {
+		runtime.HandleError(fmt.Errorf("unable to DELETE pod in kubectl %T: %v", pod, err))
+	}
+	if _, err := c.client.CoreV1().Pods(replicatedPod.Namespace).Create(replicatedPod); err != nil {
+		runtime.HandleError(fmt.Errorf("unable to CREATE pod in kubectl %T: %v", replicatedPod, err))
+	}
+}
+
+//tanle
+func (c *configFactory) updatePod(pod *v1.Pod) {
+	glog.Infof("[tanle] starting update pod %s ", pod.Name)
+	for cName, container := range pod.Spec.Containers {
+		for rName := range container.Resources.Requests {
+			quantity := container.Resources.Requests[rName]
+			switch rName {
+			case v1.ResourceCPU:
+				quantity.SetMilli(4000)
+				glog.Infof("[tanle] starting update %s cpu to %d ", pod.Name, 4000)
+			}
+
+			container.Resources.Requests[rName] = quantity
+			container.Resources.Limits[rName] = quantity
+		}
+		pod.Spec.Containers[cName] = container
+	}
+
+	podClient := c.client.CoreV1().Pods(pod.Namespace)
+	if _, err := podClient.Update(pod); err != nil {
+		runtime.HandleError(fmt.Errorf("unable to Update pod in kubectl %T: %v", pod, err))
+	}
+}
+
 func (c *configFactory) addPodToSchedulingQueue(obj interface{}) {
+	//tanle: create 2 replicate pods that profile CPU & GPU jobs.
+
+	if ReplicateJobFeature {
+		// glog.Infof("replicate %s", obj.(*v1.Pod).Name)
+		c.replicatePod(obj.(*v1.Pod), false)
+		// c.replicatePod(obj.(*v1.Pod), true)
+	}
+
+	if UpdateJobFeature {
+		c.updatePod(obj.(*v1.Pod))
+	}
+
 	if err := c.podQueue.Add(obj.(*v1.Pod)); err != nil {
 		runtime.HandleError(fmt.Errorf("unable to queue %T: %v", obj, err))
+	} else {
+		// tanle
+		currTime := schedulercache.GetCurrentTime()
+		schedulercache.ArrivalTimes[obj.(*v1.Pod).Name] = currTime
 	}
 }
 
@@ -807,6 +1114,11 @@ func (c *configFactory) invalidateCachedPredicatesOnUpdatePod(newPod *v1.Pod, ol
 }
 
 func (c *configFactory) deletePodFromCache(obj interface{}) {
+
+	if LogComplTimeFeature {
+		c.computeComplTimeForAllPods(true)
+	}
+
 	var pod *v1.Pod
 	switch t := obj.(type) {
 	case *v1.Pod:
@@ -1181,7 +1493,7 @@ func (c *configFactory) CreateFromKeys(predicateKeys, priorityKeys sets.String, 
 		c.equivalencePodCache = equivalence.NewCache()
 		glog.Info("Created equivalence class cache")
 	}
-
+	glog.Infof("[tanle] LogComplTimeFeature %s", LogComplTimeFeature)
 	algo := core.NewGenericScheduler(
 		c.schedulerCache,
 		c.equivalencePodCache,
@@ -1196,7 +1508,7 @@ func (c *configFactory) CreateFromKeys(predicateKeys, priorityKeys sets.String, 
 		c.alwaysCheckAllPredicates,
 		c.disablePreemption,
 		c.percentageOfNodesToScore,
-	)
+		c.client)
 
 	podBackoff := util.CreateDefaultPodBackoff()
 	return &scheduler.Config{
@@ -1214,9 +1526,10 @@ func (c *configFactory) CreateFromKeys(predicateKeys, priorityKeys sets.String, 
 		NextPod: func() *v1.Pod {
 			return c.getNextPod()
 		},
-		Error:          c.MakeDefaultErrorFunc(podBackoff, c.podQueue),
-		StopEverything: c.StopEverything,
-		VolumeBinder:   c.volumeBinder,
+		Error: c.MakeDefaultErrorFunc(podBackoff, c.podQueue),
+		DeletePodFromQueueingSchedule: c.DeletePod(c.podQueue), // tanle added this function.
+		StopEverything:                c.StopEverything,
+		VolumeBinder:                  c.volumeBinder,
 	}, nil
 }
 
@@ -1280,13 +1593,31 @@ func (c *configFactory) getPluginArgs() (*PluginFactoryArgs, error) {
 	}, nil
 }
 
+// func (c *configFactory) getNextPod() *v1.Pod {
+// 	pod, err := c.podQueue.Pop()
+// 	if err == nil {
+// 		glog.V(4).Infof("About to try and schedule pod %v/%v", pod.Namespace, pod.Name)
+// 		return pod
+// 	}
+// 	glog.Errorf("Error while retrieving next pod from scheduling queue: %v", err)
+// 	return nil
+// }
+
 func (c *configFactory) getNextPod() *v1.Pod {
-	pod, err := c.podQueue.Pop()
-	if err == nil {
-		glog.V(4).Infof("About to try and schedule pod %v/%v", pod.Namespace, pod.Name)
-		return pod
+	if schedulercache.ENABLE_ONLINE_SCHEDULER {
+		if pod := c.podQueue.PickNextPod(c.GetClient()); pod != nil {
+			return pod
+		} else {
+			return nil
+		}
+	} else {
+		pod, err := c.podQueue.Pop()
+		if err == nil {
+			glog.V(4).Infof("About to try and schedule pod %v/%v", pod.Namespace, pod.Name)
+			return pod
+		}
+		glog.Errorf("Error while retrieving next pod from scheduling queue: %v", err)
 	}
-	glog.Errorf("Error while retrieving next pod from scheduling queue: %v", err)
 	return nil
 }
 

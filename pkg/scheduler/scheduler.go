@@ -148,6 +148,9 @@ type Config struct {
 
 	// Disable pod preemption or not.
 	DisablePreemption bool
+
+	//tanle
+	DeletePodFromQueueingSchedule func(*v1.Pod)
 }
 
 // NewFromConfigurator returns a new scheduler that is created entirely by the Configurator.  Assumes Create() is implemented.
@@ -193,7 +196,9 @@ func (sched *Scheduler) Config() *Config {
 
 // schedule implements the scheduling algorithm and returns the suggested host.
 func (sched *Scheduler) schedule(pod *v1.Pod) (string, error) {
+
 	host, err := sched.config.Algorithm.Schedule(pod, sched.config.NodeLister)
+
 	if err != nil {
 		pod = pod.DeepCopy()
 		sched.config.Error(pod, err)
@@ -204,8 +209,19 @@ func (sched *Scheduler) schedule(pod *v1.Pod) (string, error) {
 			Reason:  v1.PodReasonUnschedulable,
 			Message: err.Error(),
 		})
+		// glog.Infof("[tanle] %v/%v FailedScheduling due to %v", pod.Namespace, pod.Name, err.Error())
+		machineId := schedulercache.MachinePodMap[pod.Name]
+		delete(schedulercache.MachinePodMap, pod.Name)
+		delete(schedulercache.PodMachineMap, machineId)
+		if !schedulercache.IsGpuPod(pod) {
+			// out of CPU, take next round for a new set of users. (allox)
+			schedulercache.NEXT_ROUND = true
+		}
+		// schedulercache.UpdateFairScore(pod, false)
 		return "", err
 	}
+
+	schedulercache.UpdateFairScore(pod, true)
 	return host, err
 }
 
@@ -371,6 +387,8 @@ func (sched *Scheduler) bind(assumed *v1.Pod, b *v1.Binding) error {
 		glog.Errorf("scheduler cache FinishBinding failed: %v", err)
 	}
 	if err != nil {
+		// schedulercache.DeleteFromSchedPodQueue(assumed) //tanle
+		// glog.Infof("[tanle] Failed to bind %v/%v on GPU %v-->%v", assumed.Namespace, assumed.Name, schedulercache.IsGpuPod(assumed), err)
 		glog.V(1).Infof("Failed to bind pod: %v/%v", assumed.Namespace, assumed.Name)
 		if err := sched.config.SchedulerCache.ForgetPod(assumed); err != nil {
 			glog.Errorf("scheduler cache ForgetPod failed: %v", err)
@@ -385,6 +403,8 @@ func (sched *Scheduler) bind(assumed *v1.Pod, b *v1.Binding) error {
 		return err
 	}
 
+	glog.Infof("[tanle] binding %v/%v on GPU %v-->%v", assumed.Namespace, assumed.Name, schedulercache.IsGpuPod(assumed), b.Target.Name)
+	// schedulercache.DeleteFromSchedPodQueue(assumed) //tanle
 	metrics.BindingLatency.Observe(metrics.SinceInMicroseconds(bindingStart))
 	metrics.SchedulingLatency.WithLabelValues(metrics.Binding).Observe(metrics.SinceInSeconds(bindingStart))
 	sched.config.Recorder.Eventf(assumed, v1.EventTypeNormal, "Scheduled", "Successfully assigned %v/%v to %v", assumed.Namespace, assumed.Name, b.Target.Name)
@@ -393,7 +413,23 @@ func (sched *Scheduler) bind(assumed *v1.Pod, b *v1.Binding) error {
 
 // scheduleOne does the entire scheduling workflow for a single pod.  It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) scheduleOne() {
+	//tanle syn cache info
+	sched.config.SchedulerCache.UpdateNodeNameToInfoMap(schedulercache.NodeNameToInfo)
+	//[tanle] update cluster info
+	sched.config.Algorithm.SynClusterInfo(sched.config.NodeLister)
 	pod := sched.config.NextPod()
+
+	if schedulercache.ENABLE_ONLINE_SCHEDULER {
+		if pod == nil { // tanle : do nothing when there is no pod.
+			return
+		}
+		//tanle add the to temp scheduled queue
+		schedulercache.AddToSchedPodQueue(pod)
+		// tanle delete the pod from the queue if it is scheduled
+		// If it is failed, it will be added back to the queue later
+		// sched.config.DeletePodFromQueueingSchedule(pod)
+	}
+
 	if pod.DeletionTimestamp != nil {
 		sched.config.Recorder.Eventf(pod, v1.EventTypeWarning, "FailedScheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
 		glog.V(3).Infof("Skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
@@ -441,6 +477,9 @@ func (sched *Scheduler) scheduleOne() {
 	if err != nil {
 		return
 	}
+	//tanle syn cache info
+	sched.config.SchedulerCache.UpdateNodeNameToInfoMap(schedulercache.NodeNameToInfo)
+
 	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
 	go func() {
 		// Bind volumes first before Pod

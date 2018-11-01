@@ -33,7 +33,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utiltrace "k8s.io/apiserver/pkg/util/trace"
+	clientset "k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/kubernetes/pkg/scheduler/algorithm"
@@ -45,6 +48,262 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/pkg/scheduler/volumebinder"
 )
+
+//tanle
+// GetAllNamespaces gets all namespaces //tanle
+func GetAllNamespaces(nodeNameToInfo map[string]*schedulercache.NodeInfo, nodes []*v1.Node) []string {
+	names := sets.String{}
+	for _, node := range nodes {
+		pods := nodeNameToInfo[node.Name].Pods()
+		for _, pod := range pods {
+			if pod.Namespace != "kube-system" {
+				names.Insert(pod.Namespace)
+			}
+		}
+	}
+	return names.List()
+}
+
+// GetMaxResource retrives the total allocable resources of the cluster //tanle
+func GetMaxResource(nodeNameToInfo map[string]*schedulercache.NodeInfo, nodes []*v1.Node) *schedulercache.Resource {
+	result := &schedulercache.Resource{}
+	for _, node := range nodes {
+		nodeInfo := nodeNameToInfo[node.Name]
+		result.MilliCPU += nodeInfo.AllocatableResource().MilliCPU
+		result.Memory += nodeInfo.AllocatableResource().Memory
+		result.ScalarResources[schedulercache.NvidiaGPU] += nodeInfo.AllocatableResource().ScalarResources[schedulercache.NvidiaGPU]
+		result.EphemeralStorage += nodeInfo.AllocatableResource().EphemeralStorage
+	}
+	return result
+}
+
+// GetResourceRequest obtains the resource request of a pod
+func GetResourceRequest(pod *v1.Pod) *schedulercache.Resource {
+	result := &schedulercache.Resource{}
+	for _, container := range pod.Spec.Containers {
+		result.Add(container.Resources.Requests)
+	}
+
+	// take max_resource(sum_pod, any_init_container)
+	for _, container := range pod.Spec.InitContainers {
+		for rName, rQuantity := range container.Resources.Requests {
+			switch rName {
+			case v1.ResourceMemory:
+				if mem := rQuantity.Value(); mem > result.Memory {
+					result.Memory = mem
+				}
+			case v1.ResourceEphemeralStorage:
+				if ephemeralStorage := rQuantity.Value(); ephemeralStorage > result.EphemeralStorage {
+					result.EphemeralStorage = ephemeralStorage
+				}
+			case v1.ResourceCPU:
+				if cpu := rQuantity.MilliValue(); cpu > result.MilliCPU {
+					result.MilliCPU = cpu
+				}
+			case schedulercache.NvidiaGPU:
+				if gpu := rQuantity.Value(); gpu > result.ScalarResources[schedulercache.NvidiaGPU] {
+					result.ScalarResources[schedulercache.NvidiaGPU] = gpu
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+// IRA_Add adds ResourceList into Resource.
+func AddIRA(result *schedulercache.Resource, rl v1.ResourceList) *schedulercache.Resource {
+	// result := &schedulercache.Resource{}
+	// if r == nil {
+	// 	return result
+	// }
+	milliCPU := int64(0)
+	nvidiaGPU := int64(0)
+	memory := int64(0)
+	for rName, rQuant := range rl {
+		switch rName {
+		case v1.ResourceCPU:
+			milliCPU += rQuant.MilliValue()
+		case v1.ResourceMemory:
+			memory += rQuant.Value()
+		case schedulercache.NvidiaGPU:
+			nvidiaGPU += rQuant.Value()
+		}
+	}
+	result.ScalarResources[schedulercache.NvidiaGPU] += nvidiaGPU
+	result.Memory += memory
+	if nvidiaGPU == 0 { // ignore cpu usage of GPU jobs
+		result.MilliCPU += milliCPU
+	}
+	return result
+}
+
+// GetResourceUsageByNamespace obatains the resource usage by namespace (user) //tanle
+func GetResourceUsageByNamespace(nodeNameToInfo map[string]*schedulercache.NodeInfo, nodes []*v1.Node, ns string) *schedulercache.Resource {
+	result := &schedulercache.Resource{}
+	for _, node := range nodes {
+		// count the scheduled pods.
+		pods := nodeNameToInfo[node.Name].Pods()
+		for _, pod := range pods {
+			if pod.Namespace == ns {
+				// glog.Infof("pod: %s status.phase %s", pod.Name, pod.Status.Phase)
+				for _, container := range pod.Spec.Containers {
+					result = AddIRA(result, container.Resources.Requests)
+				}
+
+			}
+		}
+	}
+	// glog.Infof("namespace: %s usage %s", ns, *result)
+
+	return result
+}
+
+type Demand struct {
+	cpu     float64
+	mem     float64
+	gpu     float64
+	gpu_mem float64
+	beta    float64
+}
+
+var namespaces = []string{"user1", "user2", "user3", "user4"}
+
+func getDemand(namespace string) *Demand {
+	resDemand := &Demand{cpu: 0.0, mem: 0.0, gpu: 0.0, gpu_mem: 0.0}
+	// (com, mem, beta) = (80000.0,4000,2.5)
+	// (com, mem, beta) = (112000.0,4000,3.5)
+	// (com, mem, beta) = (192000.0,4000,6.0)
+	// (com, mem, beta) = (288000.0,4000,9.0)
+	switch namespace {
+	case "user1":
+		resDemand.cpu = 16000
+		resDemand.mem = 4 * GI
+		resDemand.gpu = 1
+		resDemand.gpu_mem = 2 * GI
+		resDemand.beta = 5 * resDemand.cpu / resDemand.gpu
+	case "user2":
+		resDemand.cpu = 16000
+		resDemand.mem = 8 * GI
+		resDemand.gpu = 1
+		resDemand.beta = 7 * resDemand.cpu / resDemand.gpu
+	case "user3":
+		resDemand.cpu = 16000
+		resDemand.mem = 6 * GI
+		resDemand.gpu = 1
+		resDemand.gpu_mem = 2 * GI
+		resDemand.beta = 12 * resDemand.cpu / resDemand.gpu
+	case "user4":
+		resDemand.cpu = 16000
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 1
+		resDemand.gpu_mem = 2 * GI
+		resDemand.beta = 18 * resDemand.cpu / resDemand.gpu
+	}
+	return resDemand
+}
+
+const MILLI = 1000
+const GI = 1024 * 1024 * 1024
+
+func getTraditionalDemand_GPU(namespace string) *Demand {
+	resDemand := &Demand{cpu: 0.0, mem: 0.0, gpu: 0.0, beta: 0.0}
+	switch namespace {
+	case "user1":
+		resDemand.cpu = 1 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 1
+	case "user2":
+		resDemand.cpu = 1 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 1
+	case "user3":
+		resDemand.cpu = 1 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 1
+	case "user4":
+		resDemand.cpu = 1 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 1
+	}
+	return resDemand
+}
+
+func getTraditionalDemand(namespace string) *Demand {
+	resDemand := &Demand{cpu: 0.0, mem: 0.0, gpu: 0.0, beta: 0.0}
+	switch namespace {
+	case "user1":
+		resDemand.cpu = 16 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 0
+	case "user2":
+		resDemand.cpu = 16 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 0
+	case "user3":
+		resDemand.cpu = 16 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 0
+	case "user4":
+		resDemand.cpu = 16 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 0
+	default:
+		resDemand.cpu = 16 * MILLI
+		resDemand.mem = 12 * GI
+		resDemand.gpu = 0
+	}
+	return resDemand
+}
+
+func AllocateES(namespaces []string, capacity schedulercache.Resource) []*schedulercache.Resource {
+	n := len(namespaces)
+	shares := make([]*schedulercache.Resource, n)
+	for i := 0; i < n; i++ {
+		shares[i] = &schedulercache.Resource{}
+		shares[i].MilliCPU = int64(float64(capacity.MilliCPU) / float64(n))
+		shares[i].Memory = int64(float64(capacity.Memory) / float64(n))
+		shares[i].ScalarResources[schedulercache.NvidiaGPU] = int64(float64(capacity.ScalarResources[schedulercache.NvidiaGPU]) / float64(n))
+	}
+	return shares
+}
+
+func AllocateStatic(namespaces []string, capacity schedulercache.Resource) []*schedulercache.Resource {
+	n := len(namespaces)
+	shares := make([]*schedulercache.Resource, n)
+
+	// shares[0] = &schedulercache.Resource{}
+	// shares[0].MilliCPU = 2000
+	// shares[0].Memory = 24 * GI
+	// shares[0].NvidiaGPU = 2
+
+	// shares[1] = &schedulercache.Resource{}
+	// shares[1].MilliCPU = 86000
+	// shares[1].Memory = (240 - 24) * GI
+	// shares[1].NvidiaGPU = 2
+
+	shares[0] = &schedulercache.Resource{}
+	shares[0].MilliCPU = 32000
+	shares[0].Memory = 24 * GI
+	shares[0].ScalarResources[schedulercache.NvidiaGPU] = 0
+
+	shares[1] = &schedulercache.Resource{}
+	shares[1].MilliCPU = 0000
+	shares[1].Memory = 12 * GI
+	shares[1].ScalarResources[schedulercache.NvidiaGPU] = 0
+
+	shares[2] = &schedulercache.Resource{}
+	shares[2].MilliCPU = 16000
+	shares[2].Memory = 12 * GI
+	shares[2].ScalarResources[schedulercache.NvidiaGPU] = 0
+
+	shares[3] = &schedulercache.Resource{}
+	shares[3].MilliCPU = 16000
+	shares[3].Memory = 12 * GI
+	shares[3].ScalarResources[schedulercache.NvidiaGPU] = 0
+
+	return shares
+}
 
 const (
 	// minFeasibleNodesToFind is the minimum number of nodes that would be scored
@@ -109,11 +368,95 @@ type genericScheduler struct {
 	pvcLister                corelisters.PersistentVolumeClaimLister
 	disablePreemption        bool
 	percentageOfNodesToScore int32
+	client                   clientset.Interface //tanle placing the pod on different devices.
+}
+
+//[tanle] placeOnOtherDevice
+func CreatePodOnOtherDevice(pod *v1.Pod) *v1.Pod {
+	toBeGPU := true
+	// check the device of the pod
+	for _, container := range pod.Spec.Containers {
+		if strings.Contains(container.Image, "gpu") {
+			toBeGPU = false
+			break
+		}
+	}
+
+	// delete the pod in kube system
+	replicatedPod := pod.DeepCopy()
+
+	for cName, container := range replicatedPod.Spec.Containers {
+		if toBeGPU {
+			container.Image = "lenhattan86/ira:gpu"
+		} else {
+			container.Image = "lenhattan86/ira:cpu"
+		}
+		// switch commands
+		mainCmd := container.Command[3]
+		container.Command[3] = container.Command[2]
+		container.Command[2] = mainCmd
+		// switch demands
+		mainDemand := container.Command[5]
+		container.Command[5] = container.Command[4]
+		container.Command[4] = mainDemand
+
+		cpuDemand, gpuDemand, memory := schedulercache.GetSecondaryDemand(pod)
+
+		for rName := range container.Resources.Requests {
+			quantity := container.Resources.Requests[rName]
+			switch rName {
+			case v1.ResourceCPU:
+				quantity.SetMilli(cpuDemand)
+			case schedulercache.NvidiaGPU:
+				quantity.Set(gpuDemand)
+			case v1.ResourceMemory:
+				quantity.Set(memory * GI)
+			}
+			container.Resources.Requests[rName] = quantity
+			container.Resources.Limits[rName] = quantity
+		}
+		replicatedPod.Spec.Containers[cName] = container
+	}
+
+	replicatedPod.ResourceVersion = ""
+	replicatedPod.Spec.NodeName = ""
+	replicatedPod.Annotations = nil
+
+	return replicatedPod
+
+	// pod.Spec.Containers = replicatedPod.Spec.Containers
+
+	// // p.Client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
+	// if err := g.client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{}); err != nil {
+	// 	runtime.HandleError(fmt.Errorf("unable to DELETE pod in kubectl %T: %v", pod, err))
+	// }
+	// if _, err := g.client.CoreV1().Pods(replicatedPod.Namespace).Create(replicatedPod); err != nil {
+	// 	runtime.HandleError(fmt.Errorf("unable to CREATE pod in kubectl %T: %v", replicatedPod, err))
+	// }
+}
+func (g *genericScheduler) placeOnOtherDevice(pod *v1.Pod, replicatedPod *v1.Pod) {
+	pod.Spec.Containers = replicatedPod.Spec.Containers
+
+	// p.Client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
+	if err := g.client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{}); err != nil {
+		runtime.HandleError(fmt.Errorf("unable to DELETE pod in kubectl %T: %v", pod, err))
+	}
+	if _, err := g.client.CoreV1().Pods(replicatedPod.Namespace).Create(replicatedPod); err != nil {
+		runtime.HandleError(fmt.Errorf("unable to CREATE pod in kubectl %T: %v", replicatedPod, err))
+	}
 }
 
 // Schedule tries to schedule the given pod to one of the nodes in the node list.
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError error with reasons.
+func (g *genericScheduler) SynClusterInfo(nodeLister algorithm.NodeLister) {
+	nodes, err := nodeLister.List()
+	if err != nil {
+		return
+	}
+	schedulercache.SynClusterInfo(g.cachedNodeInfoMap, nodes)
+}
+
 func (g *genericScheduler) Schedule(pod *v1.Pod, nodeLister algorithm.NodeLister) (string, error) {
 	trace := utiltrace.New(fmt.Sprintf("Scheduling %s/%s", pod.Namespace, pod.Name))
 	defer trace.LogIfLong(100 * time.Millisecond)
@@ -136,9 +479,43 @@ func (g *genericScheduler) Schedule(pod *v1.Pod, nodeLister algorithm.NodeLister
 		return "", err
 	}
 
+	schedulercache.SynClusterInfo(g.cachedNodeInfoMap, nodes) // tanle syn cluster info manually
+
 	trace.Step("Computing predicates")
 	startPredicateEvalTime := time.Now()
 	filteredNodes, failedPredicateMap, err := g.findNodesThatFit(pod, nodes)
+
+	// tanle
+	if schedulercache.NUM_RESERVE_GPU > 0 {
+		if schedulercache.DoNotUseReserveResource(schedulercache.IsGpuPod(pod)) {
+			filteredNodes = []*v1.Node{}
+			return "", fmt.Errorf("[tanle] not enough reserved resource for this user: %s's pod: %s ", pod.Namespace, pod.Name)
+		}
+	}
+
+	//[tanle] additional scheduling & device placement
+	if schedulercache.ENABLE_OFFLINE_SCHEDULER {
+		if len(filteredNodes) >= 0 {
+			isAdmit, isSwitch := advancedSchedule(pod, g.cachedNodeInfoMap, nodes)
+			if !isAdmit {
+				filteredNodes = []*v1.Node{}
+				return "", fmt.Errorf("not enough resource for this user: %s's pod: %s ", pod.Namespace, pod.Name)
+			} else if isSwitch {
+				//switch jobs
+				glog.Infof("Place the pod %s on other device", pod.Name)
+				fakePod := CreatePodOnOtherDevice(pod)
+				availNodes, _, _ := g.findNodesThatFit(fakePod, nodes)
+				if len(availNodes) > 0 {
+					g.placeOnOtherDevice(pod, fakePod)
+					filteredNodes = availNodes
+				} else {
+					filteredNodes = []*v1.Node{}
+					return "", fmt.Errorf("not enough resource for this user: %s's pod: %s ", pod.Namespace, pod.Name)
+				}
+			}
+		}
+	}
+
 	if err != nil {
 		return "", err
 	}
@@ -171,6 +548,313 @@ func (g *genericScheduler) Schedule(pod *v1.Pod, nodeLister algorithm.NodeLister
 
 	trace.Step("Selecting host")
 	return g.selectHost(priorityList)
+}
+
+var CAPACITY = schedulercache.Resource{MilliCPU: 384 * 1000, Memory: 1152 * GI, ScalarResources: map[v1.ResourceName]int64{schedulercache.NvidiaGPU: 12}}
+
+func advancedSchedule(pod *v1.Pod,
+	nodeNameToInfo map[string]*schedulercache.NodeInfo,
+	nodes []*v1.Node) (bool, bool) {
+
+	isAdmit := true
+	isSwitch := false
+
+	uID := -1
+	for u := 0; u < len(namespaces); u++ {
+		if namespaces[u] == pod.Namespace {
+			uID = u
+		}
+	}
+
+	if uID < 0 {
+		return true, false
+	}
+
+	//tanle: DRF or FDRF allocation
+	// glog.Infof("findNodesThatFit ")
+	// namespaces := GetAllNamespaces(nodeNameToInfo, nodes)
+
+	currentUsage := GetResourceUsageByNamespace(nodeNameToInfo, nodes, pod.Namespace)
+	podDemand := GetResourceRequest(pod)
+	// capacity := GetMaxResource(nodeNameToInfo, nodes)
+	n := len(namespaces)
+	shares := make([]*schedulercache.Resource, n)
+	switch schedulercache.SCHEDULER {
+	case schedulercache.ES:
+		shares = AllocateES(namespaces, CAPACITY)
+	case schedulercache.Static:
+		shares = AllocateStatic(namespaces, CAPACITY)
+	case schedulercache.NaiveDRF:
+		shares = AllocateNaiveDRF(namespaces, CAPACITY)
+		// case schedulercache.AlloX:
+		// 	shares = AllocateAlloX(namespaces, CAPACITY)
+	}
+
+	milliCPU, gpu, memInGi := schedulercache.GetSecondaryDemand(pod)
+	secDemand := &schedulercache.Resource{MilliCPU: milliCPU, ScalarResources: map[v1.ResourceName]int64{schedulercache.NvidiaGPU: gpu}, Memory: memInGi * GI}
+	isAdmit, isSwitch = Fit(podDemand, secDemand, currentUsage, shares[uID])
+
+	if !isAdmit {
+		// glog.Infof("shares %s", shares)
+		// glog.Infof("Rejected pod: %s %s primeDemand %s secDemand %s usage %s ", pod.Namespace, pod.Name, podDemand, secDemand, currentUsage)
+		return isAdmit, isSwitch
+	}
+	// glog.Infof("admit pod: %s %s primeDemand %s secDemand %s usage %s ", pod.Namespace, pod.Name, podDemand, secDemand, currentUsage)
+	return isAdmit, isSwitch
+}
+
+// Fit fits the demand to the share.
+func Fit(priDemand *schedulercache.Resource, secDemand *schedulercache.Resource, currentUsage *schedulercache.Resource, share *schedulercache.Resource) (bool, bool) {
+	isFit := true
+	isSwitch := false
+	if priDemand.Memory+currentUsage.Memory > share.Memory {
+		// glog.Infof("demand.Memory: %d, currentUsage.Memory %d, share.Memory %d", demand.Memory, currentUsage.Memory, share.Memory)
+		return false, isSwitch
+	}
+
+	// for GPU jobs
+	if priDemand.ScalarResources[schedulercache.NvidiaGPU]+currentUsage.ScalarResources[schedulercache.NvidiaGPU] > share.ScalarResources[schedulercache.NvidiaGPU] {
+		if secDemand.MilliCPU+currentUsage.MilliCPU > share.MilliCPU {
+			isFit = false
+		} else {
+			glog.Infof("enough resource for this GPU job on CPU priDemand %s secDemand %s", priDemand, secDemand)
+			isSwitch = true
+		}
+	}
+
+	// for CPU jobs
+	if (priDemand.ScalarResources[schedulercache.NvidiaGPU] == 0) && (priDemand.MilliCPU+currentUsage.MilliCPU > share.MilliCPU) {
+		if secDemand.ScalarResources[schedulercache.NvidiaGPU]+currentUsage.ScalarResources[schedulercache.NvidiaGPU] > share.ScalarResources[schedulercache.NvidiaGPU] {
+			isFit = false
+		} else {
+			glog.Infof("enough resource this CPU job on GPU for priDemand %s secDemand %s", priDemand, secDemand)
+			isSwitch = true
+		}
+	}
+
+	return isFit, isSwitch
+}
+
+// AllocateNaiveDRF is implemented for DRF with demand (cpu, mem, gpu)
+func AllocateNaiveDRF(namespaces []string, capacity schedulercache.Resource) []*schedulercache.Resource {
+	const N_RES_DIM = 3
+	n := len(namespaces)
+	// capacityArray := [3]float64{capacity.MilliCPU, capacity.Memory, capacity.NvidiaGPU}
+	maxDemand := make([]float64, n)
+	dorminantRates := make([]float64, N_RES_DIM)
+	demands := make([]Demand, n)
+
+	for i := 0; i < n; i++ {
+		demands[i] = *getTraditionalDemand(namespaces[i])
+	}
+	// glog.Infof("capacity: %s", capacity)
+	// glog.Infof("demands: %s", demands)
+
+	// convert demand based on beta
+	for i := 0; i < n; i++ {
+		normalizedDemand := [3]float64{0, 0, 0}
+		normalizedDemand[0] = float64(demands[i].cpu) / float64(capacity.MilliCPU)
+		normalizedDemand[1] = float64(demands[i].mem) / float64(capacity.Memory)
+		normalizedDemand[2] = float64(demands[i].gpu) / float64(capacity.ScalarResources[schedulercache.NvidiaGPU])
+
+		// get the dorminant rate = max demand / capacity
+		maxDemand[i] = 0.0
+		for r := 0; r < N_RES_DIM; r++ {
+			if maxDemand[i] < normalizedDemand[r] {
+				maxDemand[i] = normalizedDemand[r]
+			}
+		}
+
+		for r := 0; r < N_RES_DIM; r++ {
+			dorminantRates[r] += normalizedDemand[r] / maxDemand[i]
+		}
+		// glog.Infof("normalizedDemand: ", normalizedDemand)
+	}
+	// glog.Infof("dorminantRates: ", dorminantRates)
+	// get total doriminant share of all users
+	dorminantShare := 0.0
+	for r := 0; r < N_RES_DIM; r++ {
+		if dorminantShare < dorminantRates[r] {
+			dorminantShare = dorminantRates[r]
+		}
+	}
+	// compute the share for each user = capacity/dorminantRate * demand/dorminantDemand
+	shares := make([]*schedulercache.Resource, n)
+	for i := 0; i < n; i++ {
+		ratio := dorminantShare * maxDemand[i]
+		shares[i] = &schedulercache.Resource{}
+		shares[i].MilliCPU = int64(demands[i].cpu / ratio)
+		shares[i].Memory = int64(demands[i].mem / ratio)
+		shares[i].ScalarResources[schedulercache.NvidiaGPU] = int64(Round(demands[i].gpu/ratio, 0.5, 4))
+	}
+
+	return shares
+}
+
+//Round: add round functions // tanle
+func Round(val float64, roundOn float64, places int) float64 {
+
+	pow := math.Pow(10, float64(places))
+	digit := pow * val
+	_, div := math.Modf(digit)
+
+	var round float64
+	if val > 0 {
+		if div >= roundOn {
+			round = math.Ceil(digit)
+		} else {
+			round = math.Floor(digit)
+		}
+	} else {
+		if div >= roundOn {
+			round = math.Floor(digit)
+		} else {
+			round = math.Ceil(digit)
+		}
+	}
+
+	return round / pow
+}
+
+type IndexSorter struct {
+	Target  []float64
+	Indices []int
+}
+
+func NewSorter(t []float64) IndexSorter {
+	iv := make([]int, len(t))
+	for i := range iv {
+		iv[i] = i
+	}
+	return IndexSorter{Target: t, Indices: iv}
+}
+func (s IndexSorter) Len() int           { return len(s.Target) }
+func (s IndexSorter) Less(i, j int) bool { return s.Target[i] < s.Target[j] }
+func (s IndexSorter) Swap(i, j int) {
+	s.Target[i], s.Target[j] = s.Target[j], s.Target[i]
+	s.Indices[i], s.Indices[j] = s.Indices[j], s.Indices[i]
+}
+
+// AllocateAlloX pricing algorithm
+func AllocateAlloX(namespaces []string, capacity schedulercache.Resource) []*schedulercache.Resource {
+	nResource := 3
+	n := len(namespaces)
+	shares := make([]*schedulercache.Resource, n)
+	// step 1: sort users based on beta (ascending)
+	betas := make([]float64, n)
+	demands := make([]Demand, n)
+	for i := 0; i < n; i++ {
+		demands[i] = *getDemand(namespaces[i])
+		betas[i] = demands[i].beta
+	}
+	// sort.Float64s(betas)
+	s := NewSorter(betas)
+	sort.Sort(s)
+	betas = s.Target
+	sortedIds := s.Indices
+	sortedDemands := make([]Demand, n)
+	for i := 0; i < n; i++ {
+		sortedDemands[i] = demands[sortedIds[i]] // sort demands according to betas
+	}
+
+	// step 2: initialization
+	price := make([]float64, nResource)
+	price[0] = 1          // for cpu
+	price[1] = betas[n-1] // for GPU
+	useralloc := UserAlloc(betas, price)
+	prevUserAlloc := useralloc
+
+	currLoad := sumResourceNorm(useralloc) // normalized load
+	gpumin := n - 1
+	flag := true
+
+	if n == 0 {
+		return shares
+	} else if n == 1 {
+		useralloc[0].cpu = 1.0
+		useralloc[0].mem = 1.0
+		useralloc[0].gpu = 1.0
+	}
+
+	// step 3: pricing
+	for flag {
+		if currLoad.cpu <= currLoad.gpu {
+			prevLoad := sumResourceNorm(prevUserAlloc)
+			useralloc = prevUserAlloc
+			useralloc[gpumin].cpu = prevUserAlloc[gpumin].cpu + (prevLoad.gpu-prevLoad.cpu)*float64(CAPACITY.MilliCPU)/2
+			useralloc[gpumin].gpu = prevUserAlloc[gpumin].gpu - (prevLoad.gpu-prevLoad.cpu)*float64(CAPACITY.ScalarResources[schedulercache.NvidiaGPU])/2
+			break
+		}
+
+		gpumin = gpumin - 1
+		if gpumin < 0 {
+			print("###gpumin is negative####")
+			break
+		}
+
+		price[0] = 1
+		price[1] = betas[gpumin]
+		prevUserAlloc = useralloc
+		useralloc = UserAlloc(betas, price)
+		currLoad = sumResourceNorm(useralloc)
+	}
+
+	sumAlloc := sumResource(useralloc)
+
+	//
+	for i := 0; i < n; i++ {
+		demand := demands[i]
+		shares[sortedIds[i]] = &schedulercache.Resource{}
+		shares[sortedIds[i]].MilliCPU = int64(useralloc[i].cpu * float64(capacity.MilliCPU) / sumAlloc.cpu)
+		gpu := Round(useralloc[i].gpu*float64(capacity.ScalarResources[schedulercache.NvidiaGPU])/sumAlloc.gpu, 0.5, 0)
+		shares[sortedIds[i]].ScalarResources[schedulercache.NvidiaGPU] = int64(gpu)
+		mem := (float64(shares[sortedIds[i]].MilliCPU) / demand.cpu * demand.mem) + (float64(shares[sortedIds[i]].ScalarResources[schedulercache.NvidiaGPU]) / demand.gpu * demand.gpu_mem)
+		roundGi := Round(mem/GI, 0.5, 0)
+		shares[sortedIds[i]].Memory = int64(roundGi * GI)
+	}
+	return shares
+}
+
+func sumResource(resources []*Demand) *Demand {
+	result := &Demand{0, 0, 0, 0, 0}
+	for _, res := range resources {
+		result.cpu = result.cpu + res.cpu
+		result.mem = result.mem + res.mem
+		result.gpu = result.gpu + res.gpu
+	}
+	return result
+}
+
+func sumResourceNorm(resources []*Demand) *Demand {
+	result := &Demand{0, 0, 0, 0, 0}
+	for _, res := range resources {
+		result.cpu = result.cpu + res.cpu
+		result.mem = result.mem + res.mem
+		result.gpu = result.gpu + res.gpu
+	}
+	result.cpu = result.cpu / (float64)(CAPACITY.MilliCPU)
+	result.mem = result.mem / (float64)(CAPACITY.Memory)
+	result.gpu = result.gpu / (float64)(CAPACITY.ScalarResources[schedulercache.NvidiaGPU])
+	return result
+}
+
+func UserAlloc(betas []float64, currentPrices []float64) []*Demand {
+	n := len(betas)
+	userAlloc := make([]*Demand, n)
+	for j := 0; j < n; j++ {
+		beta := betas[j]
+		alloc := &Demand{0, 0, 0, 0, 0}
+		if beta < currentPrices[1] {
+			alloc.cpu = 1
+			alloc.gpu = 0
+		} else // if beta = price, put it in GPU.
+		{
+			alloc.cpu = 0
+			alloc.gpu = 1 / currentPrices[1]
+		}
+		userAlloc[j] = alloc
+	}
+	return userAlloc
 }
 
 // Prioritizers returns a slice containing all the scheduler's priority
@@ -228,6 +912,8 @@ func (g *genericScheduler) Preempt(pod *v1.Pod, nodeLister algorithm.NodeLister,
 		return nil, nil, nil, nil
 	}
 	err := g.cache.UpdateNodeNameToInfoMap(g.cachedNodeInfoMap)
+	nodes, _ := nodeLister.List()
+	schedulercache.SynClusterInfo(g.cachedNodeInfoMap, nodes) // tanle syn cluster info manually
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1133,7 +1819,50 @@ func NewGenericScheduler(
 	alwaysCheckAllPredicates bool,
 	disablePreemption bool,
 	percentageOfNodesToScore int32,
-) algorithm.ScheduleAlgorithm {
+	client clientset.Interface) algorithm.ScheduleAlgorithm {
+
+	// numOfUsers := 3
+	glog.Infof("version 1.11: 2018.10.29 4:00 EUROSYS1.3")
+	// glog.Infof("Offline ENABLE_OFFLINE_SCHEDULER: %s", ENABLE_OFFLINE_SCHEDULER)
+	glog.Infof("ENABLE_PROFILING %v", schedulercache.ENABLE_PROFILING)
+	if schedulercache.ENABLE_ONLINE_SCHEDULER {
+		glog.Infof("============= IRA =============")
+		glog.Infof("IS_TEST: %v", schedulercache.IS_TEST)
+		glog.Infof("QUEUED_UP_JOBS: %v", schedulercache.QUEUED_UP_JOBS)
+		glog.Infof("NUM_USERS: %v", schedulercache.NUM_USERS)
+		glog.Infof("SCHEDULER %s", schedulercache.SCHEDULER)
+		glog.Infof("NUM_RESERVE_CPU_NODE %s", schedulercache.NUM_RESERVE_CPU_NODE)
+		glog.Infof("ENABLE_MOCKUP_GPU %s", schedulercache.ENABLE_MOCKUP_GPU)
+		if schedulercache.ENABLE_MOCKUP_GPU {
+			glog.Infof("NUM_MOCKUP_GPUS_PER_NODE: %d", schedulercache.NUM_MOCKUP_GPUS_PER_NODE)
+		}
+		schedulercache.SynClusterInfo(make(map[string]*schedulercache.NodeInfo), nil) // tanle syn cluster info manually
+		schedulercache.InitParameters()
+	}
+
+	// glog.Infof("CAPACITY %s", CAPACITY)
+	// glog.Infof("namespaces %s", namespaces)
+	// glog.Infof("numOfUsers %s", numOfUsers)
+	// schedulercache.InitAllNameSpaces(numOfUsers)
+
+	// n := len(namespaces)
+	// shares := make([]*schedulercache.Resource, n)
+	// switch SCHEDULER {
+	// case ES:
+	// 	shares = AllocateES(namespaces, CAPACITY)
+	// case Static:
+	// 	shares = AllocateStatic(namespaces, CAPACITY)
+	// case AlloX:
+	// 	shares = AllocateAlloX(namespaces, CAPACITY)
+	// case NaiveDRF:
+	// 	shares = AllocateNaiveDRF(namespaces, CAPACITY)
+	// }
+	// for _, username := range namespaces {
+	// 	glog.Infof("%s's demand %s", username, getDemand(username))
+	// 	glog.Infof("%s's traditional demand %s", username, getTraditionalDemand(username))
+	// }
+	// glog.Infof("shares %s", shares)
+
 	return &genericScheduler{
 		cache:                    cache,
 		equivalenceCache:         eCache,
@@ -1149,5 +1878,6 @@ func NewGenericScheduler(
 		alwaysCheckAllPredicates: alwaysCheckAllPredicates,
 		disablePreemption:        disablePreemption,
 		percentageOfNodesToScore: percentageOfNodesToScore,
+		client: client,
 	}
 }

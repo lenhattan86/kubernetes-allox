@@ -78,6 +78,7 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 			Reason:  "UnexpectedAdmissionError",
 			Message: message,
 		}
+
 	}
 
 	// Remove the requests of the extended resources that are missing in the
@@ -123,6 +124,7 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 				Reason:  "UnknownReason",
 				Message: message,
 			}
+
 		}
 		// If there are failed predicates, we only return the first one as a reason.
 		r := reasons[0]

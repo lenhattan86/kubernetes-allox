@@ -85,4 +85,6 @@ type ScheduleAlgorithm interface {
 	// Prioritizers returns a slice of priority config. This is exposed for
 	// testing.
 	Prioritizers() []PriorityConfig
+	//tanle syn cluster info
+	SynClusterInfo(NodeLister)
 }

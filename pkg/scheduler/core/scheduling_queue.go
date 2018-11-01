@@ -30,16 +30,20 @@ import (
 	"container/heap"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/golang/glog"
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
 	priorityutil "k8s.io/kubernetes/pkg/scheduler/algorithm/priorities/util"
+	schedulercache "k8s.io/kubernetes/pkg/scheduler/cache"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
 
@@ -48,6 +52,8 @@ import (
 // makes it easy to use those data structures as a SchedulingQueue.
 type SchedulingQueue interface {
 	Add(pod *v1.Pod) error
+	PickNextPod(client clientset.Interface) *v1.Pod // TanLe
+	Sort()                                          // TanLe
 	AddIfNotPresent(pod *v1.Pod) error
 	AddUnschedulableIfNotPresent(pod *v1.Pod) error
 	Pop() (*v1.Pod, error)
@@ -63,6 +69,10 @@ type SchedulingQueue interface {
 // NewSchedulingQueue initializes a new scheduling queue. If pod priority is
 // enabled a priority queue is returned. If it is disabled, a FIFO is returned.
 func NewSchedulingQueue() SchedulingQueue {
+	// tanle do not use priority queue
+	if schedulercache.ENABLE_ONLINE_SCHEDULER {
+		return NewFIFO()
+	}
 	if util.PodPriorityEnabled() {
 		return NewPriorityQueue()
 	}
@@ -80,6 +90,131 @@ var _ = SchedulingQueue(&FIFO{}) // Making sure that FIFO implements SchedulingQ
 // Add adds a pod to the FIFO.
 func (f *FIFO) Add(pod *v1.Pod) error {
 	return f.FIFO.Add(pod)
+}
+
+var START_SCHEDULING = false
+
+func (f *FIFO) Sort() { // tanle
+	allPods := f.FIFO.List()
+	glog.Infof("[tanle] SchedulingQueue.Sort() number of pods in the queue %d", len(f.FIFO.List()))
+
+	// allPods := make([]*v1.Pod, 0)
+	// delete all pods
+	// flag := true
+	// i := 0
+	// for flag {
+	// 	pod, _ := f.Pop()
+	// 	if pod == nil {
+	// 		glog.Infof("[tanle] SchedulingQueue.Sort() -- empty the queue")
+	// 		flag = false
+	// 	} else {
+	// 		allPods = append(allPods, pod)
+	// 		glog.Infof("[tanle] SchedulingQueue.Sort() -- number of pods in allPods %d", len(allPods))
+	// 		glog.Infof("[tanle] remove Pod %v", pod.Name)
+	// 		i++
+	// 	}
+	// }
+
+	// for SRPT
+	sort.SliceStable(allPods, func(i, j int) bool {
+		pod1 := allPods[i].(*v1.Pod)
+		pod2 := allPods[j].(*v1.Pod)
+		p1 := schedulercache.GetCpuComplTime(pod1)
+		p2 := schedulercache.GetCpuComplTime(pod2)
+		return p1 < p2
+	})
+
+	// empty the queue
+	for _, pod := range allPods {
+		f.FIFO.Delete(pod.(*v1.Pod))
+	}
+
+	// fill the queue with sorted items.
+	// glog.Infof("[tanle] refill the queue with %d items", len(allPods))
+	str := ""
+	for _, pod := range allPods {
+		str += ("," + pod.(*v1.Pod).Name)
+		f.FIFO.Add(pod)
+	}
+	glog.Infof("[tanle] Sorted Pods: %v", str)
+}
+
+func (f *FIFO) Poll() *v1.Pod { // tanle
+	for true {
+		time.Sleep(10 * time.Millisecond)
+		allPods := f.FIFO.List()
+		if (len(allPods)) > 0 {
+			return allPods[0].(*v1.Pod)
+		}
+	}
+	return nil
+}
+
+func (f *FIFO) List() []*v1.Pod { // tanle
+	allPods := []*v1.Pod{}
+	items := f.FIFO.List()
+	for _, item := range items {
+		allPods = append(allPods, item.(*v1.Pod))
+	}
+	return allPods
+}
+
+var periodicCount = 0
+
+func (f *FIFO) PickNextPod(client clientset.Interface) *v1.Pod { // tanle
+	for true {
+		time.Sleep(schedulercache.SCHEDULER_PERIOD * time.Millisecond) // we have to wait a bit for next pod comming, otherwhile -> deadlock here.
+		// if periodicCount >= 60000/schedulercache.SCHEDULER_PERIOD {
+		// 	glog.Infof("[tanle] FairScoreMap:  %v", schedulercache.FairScoreMap)
+		// 	periodicCount = 0
+		// } else {
+		// 	periodicCount++
+		// }
+		allPods := f.List()
+		var pod = schedulercache.ProfilingSchedule(allPods)
+		if pod == nil {
+			// if len(allPods) > 0 {
+			// 	pod = allPods[0]
+			// 	f.Delete(pod)
+			// 	return pod
+			// }
+
+			if len(allPods) >= schedulercache.QUEUED_UP_JOBS {
+				START_SCHEDULING = true
+				schedulercache.START_TIME = time.Now() // TODO: only works for queued up jobs.
+				schedulercache.ARRIVAL_TIME = 0
+			}
+
+			if START_SCHEDULING && len(allPods) > 0 {
+				switch schedulercache.SCHEDULER {
+				case schedulercache.ES:
+					pod = schedulercache.EqualShare(allPods, client)
+				case schedulercache.AlloX:
+					tempAlpha := schedulercache.AlphaFair
+					// increase utilization.
+					for pod == nil && tempAlpha < 2 {
+						pod = schedulercache.OnlineAllox(allPods, client, tempAlpha)
+						tempAlpha = tempAlpha * 2
+					}
+				case schedulercache.DRF:
+					pod = schedulercache.OnlineDRF(allPods, client)
+				case schedulercache.DRFFIFO:
+					schedulercache.USING_FIFO = true
+					pod = schedulercache.OnlineDRF(allPods, client)
+				case schedulercache.DRFExt:
+					pod = schedulercache.OnlineDRFExt(allPods, client)
+				case schedulercache.SJF:
+					pod = schedulercache.OnlineSJF(allPods, client, schedulercache.AlphaFair)
+				}
+			}
+		}
+		if pod != nil {
+			f.Delete(pod)
+			return pod
+		}
+
+	}
+	return nil
 }
 
 // AddIfNotPresent adds a pod to the FIFO if it is absent in the FIFO.
@@ -195,6 +330,12 @@ func NewPriorityQueue() *PriorityQueue {
 	return pq
 }
 
+//tanle
+func (p *PriorityQueue) Sort() {
+	//tanle blank function
+	glog.Infof("[tanle] PriorityQueue.Sort()")
+}
+
 // addNominatedPodIfNeeded adds a pod to nominatedPods if it has a NominatedNodeName and it does not
 // already exist in the map. Adding an existing pod is not going to update the pod.
 func (p *PriorityQueue) addNominatedPodIfNeeded(pod *v1.Pod) {
@@ -252,6 +393,10 @@ func (p *PriorityQueue) Add(pod *v1.Pod) error {
 		p.cond.Broadcast()
 	}
 	return err
+}
+
+func (p *PriorityQueue) PickNextPod(client clientset.Interface) *v1.Pod {
+	return nil
 }
 
 // AddIfNotPresent adds a pod to the active queue if it is not present in any of

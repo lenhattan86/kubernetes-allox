@@ -267,7 +267,37 @@ func (cache *schedulerCache) addPod(pod *v1.Pod) {
 		n = NewNodeInfo()
 		cache.nodes[pod.Spec.NodeName] = n
 	}
-	n.AddPod(pod)
+
+	// tanle do not add the same pod to the cache.
+	isExist := false
+	pods := n.pods
+	for _, p := range pods {
+		if p.Name == pod.Name && p.Namespace == pod.Namespace {
+			isExist = true
+			oldKey, err := getPodKey(p)
+			newKey, _ := getPodKey(pod)
+			// remove assumed pods & its states
+			if err == nil {
+				_, ok := cache.podStates[oldKey]
+				if ok && cache.assumedPods[oldKey] {
+					delete(cache.assumedPods, oldKey)
+					delete(cache.podStates, oldKey)
+					ps := &podState{
+						pod: pod,
+					}
+					cache.podStates[newKey] = ps
+				}
+			}
+			p.UID = pod.UID
+			break
+		}
+	}
+
+	// glog.Infof("[tanle] add pod pod %v/%v/%v to cache", pod.Namespace, pod.Name, pod.UID)
+	if !isExist {
+		n.AddPod(pod)
+	}
+	// n.AddPod(pod)
 }
 
 // Assumes that lock is already acquired.
@@ -281,7 +311,15 @@ func (cache *schedulerCache) updatePod(oldPod, newPod *v1.Pod) error {
 
 // Assumes that lock is already acquired.
 func (cache *schedulerCache) removePod(pod *v1.Pod) error {
+	// glog.Infof("[tanle] removePod pod %v/%v/%v/%v from cache", pod.Namespace, pod.Name, pod.UID, pod.Status.Phase)
 	n := cache.nodes[pod.Spec.NodeName]
+	// tanle remove the pod with the same name
+	/*for _, p := range n.pods {
+		if p.Namespace == pod.Namespace && p.Name == pod.Name {
+			pod = p
+		}
+	}*/
+
 	if err := n.RemovePod(pod); err != nil {
 		return err
 	}
@@ -591,6 +629,7 @@ func (cache *schedulerCache) cleanupAssumedPods(now time.Time) {
 			if err := cache.expirePod(key, ps); err != nil {
 				glog.Errorf("ExpirePod failed for %s: %v", key, err)
 			}
+
 		}
 	}
 }
